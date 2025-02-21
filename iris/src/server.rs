@@ -9,12 +9,96 @@ use tokio::sync::{mpsc, oneshot};
 use crate::commands::{DeviceCommand, ServerCommand, UserCommand};
 use crate::entities::{Device, DeviceId, DeviceState, User, UserId};
 
+#[derive(Debug, Default)]
+struct ConnectionManager {
+    user_connections: HashMap<UserId, HashSet<DeviceId>>,
+    device_connection: HashMap<DeviceId, UserId>,
+    open_devices: HashSet<DeviceId>,
+}
+
+impl ConnectionManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn connect(&mut self, user_id: &UserId, device_id: &DeviceId) -> Result<(), String> {
+        self.open_devices.remove(device_id);
+        if let Some(existing_user) = self.device_connection.get(device_id) {
+            if existing_user != user_id {
+                return Err(format!(
+                    "Device {} is already assigned to User {}",
+                    device_id, existing_user
+                ));
+            }
+        }
+        self.user_connections
+            .entry(*user_id)
+            .or_insert_with(HashSet::new)
+            .insert(*device_id);
+        self.device_connection.insert(*device_id, *user_id);
+        Ok(())
+    }
+
+    pub fn disconnect(&mut self, user_id: &UserId, device_id: &DeviceId) -> Result<(), String> {
+        if let Some(user_id) = self.device_connection.remove(device_id) {
+            if let Some(device_set) = self.user_connections.get_mut(&user_id) {
+                device_set.remove(&device_id);
+                if device_set.is_empty() {
+                    self.user_connections.remove(&user_id);
+                }
+            }
+            self.open_devices.insert(*device_id);
+            Ok(())
+        } else {
+            self.open_devices.insert(*device_id);
+            Err(format!("Device {} was not assigned to any user", device_id))
+        }
+    }
+
+    pub fn remove_device(&mut self, device_id: &DeviceId) -> Option<UserId> {
+        if let Some(user_id) = self.device_connection.remove(device_id) {
+            self.user_connections.remove(&device_id);
+            return Some(user_id);
+        }
+        None
+    }
+
+    pub fn remove_user(&mut self, user_id: &UserId) -> Option<Vec<DeviceId>> {
+        if let Some(device_set) = self.user_connections.remove(user_id) {
+            let mut opened_devices = Vec::with_capacity(device_set.len());
+            device_set.iter().for_each(|device_id| {
+                self.device_connection.remove(device_id);
+                self.open_devices.insert(*device_id);
+                opened_devices.push(*device_id);
+            });
+            return Some(opened_devices);
+        }
+        None
+    }
+
+    pub fn is_user_device(&self, user_id: DeviceId, device_id: DeviceId) -> bool {
+        todo!()
+    }
+
+    pub fn get_user_devices(&self, user_id: UserId) -> Option<Vec<&DeviceId>> {
+        let user_connections = self.user_connections.get(&user_id)?;
+        Some(user_connections.iter().collect::<Vec<&DeviceId>>())
+    }
+
+    pub fn get_device_user(&self, device_id: DeviceId) -> Option<&UserId> {
+        self.device_connection.get(&device_id)
+    }
+
+    pub fn get_open_devices(&self) -> Vec<&DeviceId> {
+        self.open_devices.iter().collect::<Vec<&DeviceId>>()
+    }
+}
+
 #[derive(Debug)]
 pub struct ConnectionServer {
     devices: HashMap<DeviceId, Device>,
     users: HashMap<UserId, User>,
-    user_connections: HashMap<UserId, HashSet<DeviceId>>,
-    device_connection: HashMap<DeviceId, UserId>,
+    connections: ConnectionManager,
     cmd_rx: mpsc::UnboundedReceiver<ServerCommand>,
 }
 
@@ -26,8 +110,7 @@ impl ConnectionServer {
             ConnectionServer {
                 devices: HashMap::new(),
                 users: HashMap::new(),
-                user_connections: HashMap::new(),
-                device_connection: HashMap::new(),
+                connections: ConnectionManager::new(),
                 cmd_rx,
             },
             ConnectionServerHandle { cmd_tx },
@@ -61,38 +144,30 @@ impl ConnectionServer {
                     let new_user = User::new(conn_tx);
                     let new_user_id = new_user.id;
                     self.users.insert(new_user_id, new_user);
-                    let _ = res_tx.send(new_user_id);
                     self.notify_user(
                         &new_user_id,
                         UserCommand::UpdateDevices {
                             devices: self
-                                .devices
-                                .values()
-                                .filter(|device| device.state != DeviceState::Connected)
+                                .connections
+                                .get_open_devices()
+                                .into_iter()
+                                .filter_map(|device_id| self.devices.get(device_id))
                                 .collect::<Vec<&Device>>(),
                         },
-                    )
-                    .await;
+                    );
+                    let _ = res_tx.send(new_user_id);
                 }
 
                 ServerCommand::UnregisterUser { user_id } => {
                     self.users.remove(&user_id);
-                    if let Some(device_ids) = self.user_connections.remove(&user_id) {
-                        device_ids.iter().for_each(|device_id| {
-                            self.device_connection.remove(device_id);
-                            if let Some(device) = self.devices.get_mut(device_id) {
-                                device.state = DeviceState::Open;
-                            }
-                        });
+                    if let Some(device_ids) = self.connections.remove_user(&user_id) {
                         self.notify_users(UserCommand::UpdateDevices {
-                            devices: self
-                                .devices
-                                .values()
-                                .filter(|device| device_ids.contains(&device.id))
+                            devices: device_ids
+                                .iter()
+                                .filter_map(|device_id| self.devices.get(device_id))
                                 .collect::<Vec<&Device>>(),
-                        })
-                        .await;
-                    };
+                        });
+                    }
                 }
 
                 ServerCommand::RegisterDevice {
@@ -102,73 +177,67 @@ impl ConnectionServer {
                 } => {
                     let new_device = Device::new(name, conn_tx);
                     let new_device_id = new_device.id;
+                    self.devices.insert(new_device_id, new_device);
+                    self.connections.open_devices.insert(new_device_id);
                     self.notify_users(UserCommand::UpdateDevices {
                         devices: vec![&new_device],
-                    })
-                    .await;
-                    self.devices.insert(new_device_id, new_device);
+                    });
                     let _ = res_tx.send(new_device_id);
                 }
 
                 ServerCommand::UnregisterDevice { device_id } => {
                     self.devices.remove(&device_id);
-
-                    if let Some(user_id) = self.device_connection.remove(&device_id) {
-                        if let Some(connections) = self.user_connections.get_mut(&user_id) {
-                            connections.remove(&device_id);
-                            self.notify_user(
-                                &user_id,
-                                UserCommand::RemoveConnectedDevice {
-                                    device_id: &device_id,
-                                },
-                            )
-                            .await;
-                        }
+                    if let Some(user_id) = self.connections.remove_device(&device_id) {
+                        self.notify_user(
+                            &user_id,
+                            UserCommand::RemoveConnectedDevice {
+                                device_id: &device_id,
+                            },
+                        );
                     } else {
                         self.notify_users(UserCommand::RemoveDevice {
                             device_id: &device_id,
-                        })
-                        .await;
-                    };
+                        });
+                    }
                 }
 
                 ServerCommand::Connect { user_id, device_id } => {
                     if let Some(device) = self.devices.get_mut(&device_id) {
-                        if device.state == DeviceState::Open {
-                            device.state = DeviceState::Connected;
-
-                            if let Some(connections) = self.user_connections.get_mut(&user_id) {
-                                connections.insert(device_id);
-                            } else {
-                                self.user_connections
-                                    .insert(user_id, HashSet::from([device_id]));
-                            }
-
-                            self.device_connection.insert(device_id, user_id);
-                            self.notify_users(UserCommand::RemoveDevice {
-                                device_id: &device_id,
-                            })
-                            .await;
-
-                            if let Some(device) = self.devices.get(&device_id) {
-                                self.notify_user(
-                                    &user_id,
-                                    UserCommand::UpdateConnectedDevice { device },
-                                )
-                                .await;
-                            }
+                        device.state = DeviceState::Connected;
+                        if let Err(err) = self.connections.connect(&user_id, &device_id) {
+                            self.notify_user(&user_id, UserCommand::Error { message: err });
+                            todo!("implement a sync command");
                         }
                     }
                 }
 
-                ServerCommand::Disconnect { user_id, device_id } => {}
+                ServerCommand::Disconnect { user_id, device_id } => {
+                    self.notify_user(
+                        &user_id,
+                        UserCommand::RemoveConnectedDevice {
+                            device_id: &device_id,
+                        },
+                    );
+                    if let Err(err) = self.connections.disconnect(&user_id, &device_id) {
+                        self.notify_user(&user_id, UserCommand::Error { message: err });
+                        todo!("implement a sync command");
+                    } else if let Some(device) = self.devices.get_mut(&device_id) {
+                        device.state = DeviceState::Open;
+                        if let Some(device) = self.devices.get(&device_id) {
+                            self.notify_users(UserCommand::UpdateDevices {
+                                devices: vec![device],
+                            });
+                        }
+                    }
+                }
 
+                //////
                 ServerCommand::UserSignaling {
                     user_id,
                     device_id,
                     signal,
                 } => {
-                    if let Some(connections) = self.user_connections.get(&user_id) {
+                    if let Some(connections) = self.connections.get(&user_id) {
                         if connections.get(&device_id).is_some() {
                             self.notify_device(&device_id, DeviceCommand::UserSignaling { signal })
                                 .await;
@@ -229,7 +298,6 @@ impl ConnectionServerHandle {
             res_tx,
         });
 
-        // unwrap: i dont care
         res_rx.await.unwrap()
     }
 
