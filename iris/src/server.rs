@@ -76,8 +76,28 @@ impl ConnectionManager {
         None
     }
 
-    pub fn is_user_device(&self, user_id: DeviceId, device_id: DeviceId) -> bool {
-        todo!()
+    pub fn is_valid_connection(&self, user_id: &DeviceId, device_id: &DeviceId) -> bool {
+        if self.open_devices.contains(device_id) {
+            return false;
+        }
+
+        if let Some(connected_user_id) = self.device_connection.get(device_id) {
+            if connected_user_id != user_id {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        if let Some(connected_device_set) = self.user_connections.get(user_id) {
+            if !connected_device_set.contains(device_id) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        true
     }
 
     pub fn get_user_devices(&self, user_id: UserId) -> Option<Vec<&DeviceId>> {
@@ -154,7 +174,8 @@ impl ConnectionServer {
                                 .filter_map(|device_id| self.devices.get(device_id))
                                 .collect::<Vec<&Device>>(),
                         },
-                    );
+                    )
+                    .await;
                     let _ = res_tx.send(new_user_id);
                 }
 
@@ -166,7 +187,8 @@ impl ConnectionServer {
                                 .iter()
                                 .filter_map(|device_id| self.devices.get(device_id))
                                 .collect::<Vec<&Device>>(),
-                        });
+                        })
+                        .await;
                     }
                 }
 
@@ -177,11 +199,12 @@ impl ConnectionServer {
                 } => {
                     let new_device = Device::new(name, conn_tx);
                     let new_device_id = new_device.id;
-                    self.devices.insert(new_device_id, new_device);
-                    self.connections.open_devices.insert(new_device_id);
                     self.notify_users(UserCommand::UpdateDevices {
                         devices: vec![&new_device],
-                    });
+                    })
+                    .await;
+                    self.devices.insert(new_device_id, new_device);
+                    self.connections.open_devices.insert(new_device_id);
                     let _ = res_tx.send(new_device_id);
                 }
 
@@ -193,11 +216,13 @@ impl ConnectionServer {
                             UserCommand::RemoveConnectedDevice {
                                 device_id: &device_id,
                             },
-                        );
+                        )
+                        .await;
                     } else {
                         self.notify_users(UserCommand::RemoveDevice {
                             device_id: &device_id,
-                        });
+                        })
+                        .await;
                     }
                 }
 
@@ -205,7 +230,8 @@ impl ConnectionServer {
                     if let Some(device) = self.devices.get_mut(&device_id) {
                         device.state = DeviceState::Connected;
                         if let Err(err) = self.connections.connect(&user_id, &device_id) {
-                            self.notify_user(&user_id, UserCommand::Error { message: err });
+                            self.notify_user(&user_id, UserCommand::Error { message: err })
+                                .await;
                             todo!("implement a sync command");
                         }
                     }
@@ -217,44 +243,46 @@ impl ConnectionServer {
                         UserCommand::RemoveConnectedDevice {
                             device_id: &device_id,
                         },
-                    );
+                    )
+                    .await;
                     if let Err(err) = self.connections.disconnect(&user_id, &device_id) {
-                        self.notify_user(&user_id, UserCommand::Error { message: err });
+                        self.notify_user(&user_id, UserCommand::Error { message: err })
+                            .await;
                         todo!("implement a sync command");
                     } else if let Some(device) = self.devices.get_mut(&device_id) {
                         device.state = DeviceState::Open;
                         if let Some(device) = self.devices.get(&device_id) {
                             self.notify_users(UserCommand::UpdateDevices {
                                 devices: vec![device],
-                            });
+                            })
+                            .await;
                         }
                     }
                 }
 
-                //////
                 ServerCommand::UserSignaling {
                     user_id,
                     device_id,
                     signal,
                 } => {
-                    if let Some(connections) = self.connections.get(&user_id) {
-                        if connections.get(&device_id).is_some() {
-                            self.notify_device(&device_id, DeviceCommand::UserSignaling { signal })
-                                .await;
-                        }
+                    if self.connections.is_valid_connection(&user_id, &device_id) {
+                        self.notify_device(&device_id, DeviceCommand::UserSignaling { signal })
+                            .await;
                     }
                 }
 
                 ServerCommand::DeviceSignaling { device_id, signal } => {
-                    if let Some(user_id) = self.device_connection.get(&device_id) {
-                        self.notify_user(
-                            user_id,
-                            UserCommand::DeviceSignaling {
-                                device_id: &device_id,
-                                signal,
-                            },
-                        )
-                        .await;
+                    if let Some(user_id) = self.connections.get_device_user(device_id) {
+                        if self.connections.is_valid_connection(user_id, &device_id) {
+                            self.notify_user(
+                                user_id,
+                                UserCommand::DeviceSignaling {
+                                    device_id: &device_id,
+                                    signal,
+                                },
+                            )
+                            .await;
+                        }
                     }
                 }
             }
