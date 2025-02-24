@@ -23,6 +23,7 @@ impl ConnectionManager {
 
     pub fn connect(&mut self, user_id: &UserId, device_id: &DeviceId) -> Result<(), String> {
         self.open_devices.remove(device_id);
+
         if let Some(existing_user) = self.device_connection.get(device_id) {
             if existing_user != user_id {
                 return Err(format!(
@@ -31,23 +32,32 @@ impl ConnectionManager {
                 ));
             }
         }
+
         self.user_connections
             .entry(*user_id)
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(*device_id);
         self.device_connection.insert(*device_id, *user_id);
+
         Ok(())
     }
 
     pub fn disconnect(&mut self, user_id: &UserId, device_id: &DeviceId) -> Result<(), String> {
+        if !self.is_valid_connection(user_id, device_id) {
+            return Err("You are not connected to this Device".to_string());
+        }
+
         if let Some(user_id) = self.device_connection.remove(device_id) {
             if let Some(device_set) = self.user_connections.get_mut(&user_id) {
-                device_set.remove(&device_id);
+                device_set.remove(device_id);
+
                 if device_set.is_empty() {
                     self.user_connections.remove(&user_id);
                 }
             }
+
             self.open_devices.insert(*device_id);
+
             Ok(())
         } else {
             self.open_devices.insert(*device_id);
@@ -57,22 +67,27 @@ impl ConnectionManager {
 
     pub fn remove_device(&mut self, device_id: &DeviceId) -> Option<UserId> {
         if let Some(user_id) = self.device_connection.remove(device_id) {
-            self.user_connections.remove(&device_id);
+            self.user_connections.remove(device_id);
+
             return Some(user_id);
         }
+
         None
     }
 
     pub fn remove_user(&mut self, user_id: &UserId) -> Option<Vec<DeviceId>> {
         if let Some(device_set) = self.user_connections.remove(user_id) {
             let mut opened_devices = Vec::with_capacity(device_set.len());
+
             device_set.iter().for_each(|device_id| {
                 self.device_connection.remove(device_id);
                 self.open_devices.insert(*device_id);
                 opened_devices.push(*device_id);
             });
+
             return Some(opened_devices);
         }
+
         None
     }
 
@@ -100,6 +115,7 @@ impl ConnectionManager {
         true
     }
 
+    // will be used for sync cmd
     pub fn get_user_devices(&self, user_id: UserId) -> Option<Vec<&DeviceId>> {
         let user_connections = self.user_connections.get(&user_id)?;
         Some(user_connections.iter().collect::<Vec<&DeviceId>>())
@@ -163,6 +179,7 @@ impl ConnectionServer {
                 ServerCommand::RegisterUser { conn_tx, res_tx } => {
                     let new_user = User::new(conn_tx);
                     let new_user_id = new_user.id;
+
                     self.users.insert(new_user_id, new_user);
                     self.notify_user(
                         &new_user_id,
@@ -176,11 +193,13 @@ impl ConnectionServer {
                         },
                     )
                     .await;
+
                     let _ = res_tx.send(new_user_id);
                 }
 
                 ServerCommand::UnregisterUser { user_id } => {
                     self.users.remove(&user_id);
+
                     if let Some(device_ids) = self.connections.remove_user(&user_id) {
                         self.notify_users(UserCommand::UpdateDevices {
                             devices: device_ids
@@ -199,17 +218,20 @@ impl ConnectionServer {
                 } => {
                     let new_device = Device::new(name, conn_tx);
                     let new_device_id = new_device.id;
+
                     self.notify_users(UserCommand::UpdateDevices {
                         devices: vec![&new_device],
                     })
                     .await;
                     self.devices.insert(new_device_id, new_device);
                     self.connections.open_devices.insert(new_device_id);
+
                     let _ = res_tx.send(new_device_id);
                 }
 
                 ServerCommand::UnregisterDevice { device_id } => {
                     self.devices.remove(&device_id);
+
                     if let Some(user_id) = self.connections.remove_device(&device_id) {
                         self.notify_user(
                             &user_id,
@@ -229,10 +251,26 @@ impl ConnectionServer {
                 ServerCommand::Connect { user_id, device_id } => {
                     if let Some(device) = self.devices.get_mut(&device_id) {
                         device.state = DeviceState::Connected;
-                        if let Err(err) = self.connections.connect(&user_id, &device_id) {
-                            self.notify_user(&user_id, UserCommand::Error { message: err })
-                                .await;
-                            todo!("implement a sync command");
+
+                        match self.connections.connect(&user_id, &device_id) {
+                            Ok(_) => {
+                                if let Some(device) = self.devices.get(&device_id) {
+                                    self.notify_user(
+                                        &user_id,
+                                        UserCommand::UpdateConnectedDevice { device },
+                                    )
+                                    .await
+                                }
+                                self.notify_users(UserCommand::RemoveDevice {
+                                    device_id: &device_id,
+                                })
+                                .await
+                            }
+                            Err(err) => {
+                                self.notify_user(&user_id, UserCommand::Error { message: err })
+                                    .await;
+                                todo!("implement a sync command");
+                            }
                         }
                     }
                 }
@@ -245,12 +283,14 @@ impl ConnectionServer {
                         },
                     )
                     .await;
+
                     if let Err(err) = self.connections.disconnect(&user_id, &device_id) {
                         self.notify_user(&user_id, UserCommand::Error { message: err })
                             .await;
                         todo!("implement a sync command");
                     } else if let Some(device) = self.devices.get_mut(&device_id) {
                         device.state = DeviceState::Open;
+
                         if let Some(device) = self.devices.get(&device_id) {
                             self.notify_users(UserCommand::UpdateDevices {
                                 devices: vec![device],
@@ -358,5 +398,119 @@ impl ConnectionServerHandle {
         let _ = self
             .cmd_tx
             .send(ServerCommand::DeviceSignaling { device_id, signal });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn test_connection_manager_connect() {
+        let mut connection_manager = ConnectionManager::new();
+
+        let (tx, _mx) = unbounded_channel();
+
+        let test_user_1 = User::new(tx.clone());
+        let test_user_2 = User::new(tx.clone());
+
+        let test_device_1 = Device::new("test_device_1".to_string(), tx.clone());
+
+        assert!(connection_manager
+            .connect(&test_user_1.id, &test_device_1.id)
+            .is_ok());
+
+        assert!(connection_manager
+            .connect(&test_user_2.id, &test_device_1.id)
+            .is_err());
+    }
+
+    #[test]
+    fn test_connection_manager_disconnect() {
+        let mut connection_manager = ConnectionManager::new();
+
+        let (tx, _mx) = unbounded_channel();
+
+        let test_user_1 = User::new(tx.clone());
+        let test_user_2 = User::new(tx.clone());
+
+        let test_device_1 = Device::new("test_device_1".to_string(), tx.clone());
+
+        assert!(connection_manager
+            .disconnect(&test_user_1.id, &test_device_1.id)
+            .is_err());
+
+        assert!(connection_manager
+            .connect(&test_user_1.id, &test_device_1.id)
+            .is_ok());
+
+        assert!(connection_manager
+            .disconnect(&test_user_2.id, &test_device_1.id)
+            .is_err());
+
+        assert!(connection_manager
+            .disconnect(&test_user_1.id, &test_device_1.id)
+            .is_ok());
+
+        assert_eq!(
+            connection_manager.open_devices.get(&test_device_1.id),
+            Some(&test_device_1.id)
+        );
+
+        assert!(connection_manager
+            .connect(&test_user_2.id, &test_device_1.id)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_connection_manager_remove_device() {
+        let mut connection_manager = ConnectionManager::new();
+
+        let (tx, _mx) = unbounded_channel();
+
+        let test_user_1 = User::new(tx.clone());
+        let test_device_1 = Device::new("test_device_1".to_string(), tx.clone());
+
+        let _ = connection_manager.connect(&test_user_1.id, &test_device_1.id);
+
+        assert!(connection_manager.is_valid_connection(&test_user_1.id, &test_device_1.id));
+
+        assert_eq!(
+            connection_manager.remove_device(&test_device_1.id),
+            Some(test_user_1.id)
+        );
+
+        assert!(!connection_manager.is_valid_connection(&test_user_1.id, &test_device_1.id));
+    }
+
+    #[test]
+    fn test_connection_manager_remove_user() {
+        let mut connection_manager = ConnectionManager::new();
+
+        let (tx, _mx) = unbounded_channel();
+
+        let test_user_1 = User::new(tx.clone());
+        let test_user_2 = User::new(tx.clone());
+
+        let test_device_1 = Device::new("test_device_1".to_string(), tx.clone());
+
+        assert!(connection_manager
+            .connect(&test_user_1.id, &test_device_1.id)
+            .is_ok());
+
+        assert_eq!(
+            connection_manager.remove_user(&test_user_1.id),
+            Some(vec![test_device_1.id]),
+        );
+
+        assert_eq!(
+            connection_manager.open_devices.get(&test_device_1.id),
+            Some(&test_device_1.id)
+        );
+
+        assert!(connection_manager
+            .connect(&test_user_2.id, &test_device_1.id)
+            .is_ok());
     }
 }
